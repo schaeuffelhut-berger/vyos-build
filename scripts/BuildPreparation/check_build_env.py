@@ -38,17 +38,20 @@ deps = {
    'binaries': []
 }
 
-print("Checking if packages required for VyOS image build are installed")
+def check():
+    print("Checking if packages required for VyOS image build are installed")
 
-checker = util.DependencyChecker(deps)
+    checker = util.DependencyChecker(deps)
 
-missing = checker.get_missing_dependencies()
-if not missing:
-    print("All dependencies are installed")
-    sys.exit(0)
-else:
-    checker.print_missing_deps()
-    sys.exit(1)
+    missing = checker.get_missing_dependencies()
+    if not missing:
+        print("All dependencies are installed")
+        return(0)
+    else:
+        checker.print_missing_deps()
+        return(1)
 
-sys.exit(0)
 
+if __name__ == '__main__':
+    retval = check()
+    sys.exit(retval)

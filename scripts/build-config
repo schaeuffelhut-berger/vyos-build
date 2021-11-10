@@ -27,11 +27,12 @@ import argparse
 import re
 import sys
 import os
-import getpass
-import platform
 import json
 
 import defaults
+import TargetConfigFactory.helper as target_helper
+import BuildPreparation.prepare_common as prepare
+import BuildPreparation.check_build_env as check_build_env
 
 # argparse converts hyphens to underscores,
 # so for lookups in the original options hash we have to
@@ -39,116 +40,128 @@ import defaults
 def field_to_option(s):
     return re.sub(r'_', '-', s)
 
-def get_default_build_by():
-    return "{user}@{host}".format(user= getpass.getuser(), host=platform.node())
-
-def get_validator(optdict, name):
-    try:
-        return optdict[name][2]
-    except KeyError:
-        return None
-
-
-# Load the build flavor file
-build_flavor = os.getenv('VYOS_BUILD_FLAVOR')
-if build_flavor is None:
-    build_flavor = defaults.DEFAULT_BUILD_FLAVOR
-try:
-    with open(build_flavor, 'r') as f:
-        build_defaults = json.load(f)
-except Exception as e:
-    print("Failed to open the build flavor file {0}: {1}".format(build_flavor, e))
-    sys.exit(1)
-
 
 # Options dict format:
-# '$option_name_without_leading_dashes': { ('$help_string', $default_value_generator_thunk, $value_checker_thunk) }
+# '$option_name_without_leading_dashes': { **argparse_arguments }
+# Custom options (starting with '_') will not be passed to argparse:
+#   - '_validator': Custom value validation function. Checks fail when returning False.
+#   - '_rename': Maps argparse names to config option, if names differ. 
 options = {
-   'architecture': ('Image target architecture (amd64 or i386 or armhf or arm64)', lambda: build_defaults['architecture'], lambda x: x in ['amd64', 'i386', 'armhf', 'arm64']),
-   'build-by': ('Builder identifier (e.g. jrandomhacker@example.net)', get_default_build_by, None),
-   'debian-mirror': ('Debian repository mirror for ISO build', lambda: build_defaults['debian_mirror'], None),
-   'debian-security-mirror': ('Debian security updates mirror', lambda: build_defaults['debian_security_mirror'], None),
-   'pbuilder-debian-mirror': ('Debian repository mirror for pbuilder env bootstrap', lambda: build_defaults['debian_mirror'], None),
-   'vyos-mirror': ('VyOS package mirror', lambda: build_defaults["vyos_mirror"], None),
-   'build-type': ('Build type, release or development', lambda: 'development', lambda x: x in ['release', 'development']),
-   'version': ('Version number (release builds only)', None, None),
-   'build-comment': ('Optional build comment', lambda: '', None)
+    'architecture': {
+        'help': 'Image architecture module ({})'.format(' or '.join(target_helper.get_available_target_tree().keys())),
+        'type': str,
+        '_rename': 'build_architecture',
+        '_validator': lambda x: x in target_helper.get_available_target_tree().keys() or x is None,
+    },
+    'target': {
+        'help': 'Image target name of given architecture',
+        'type': str,
+        '_rename': 'build_target',
+    },
+
+    'build-by': {'help': 'Builder identifier (e.g. jrandomhacker@example.net)', 'type': str},
+    'debian-mirror': {'help': 'Debian repository mirror for ISO build', 'type': str},
+    'debian-security-mirror': {'help': 'Debian security updates mirror', 'type': str},
+    'pbuilder-debian-mirror': {'help': 'Debian repository mirror for pbuilder env bootstrap', 'type': str},
+    'vyos-mirror': {'help': 'VyOS package mirror', 'type': str},
+    'build-type': {
+        'help': 'Build type, release or development',
+        '_validator': lambda x: x in ['release', 'development'] or x is None,
+        'type': str,
+    },
+    'version': {'help': 'Version number (release builds only)', 'type': str},
+    'build-comment': {'help': 'Optional build comment', 'default': '', 'type': str},
+    'debug': {'help': "Enable debug output", 'action': 'store_true'},
+    'list-all-targets': {'help': "List all available build targets, then exit", 'action': 'store_true'},
+
+    # Custom APT entry and APT key options can be used multiple times
+    'custom-apt-entry': {'help': "Custom APT entry", 'action': 'append', '_rename': 'additional_repositories'},
+    'custom-apt-key': {'help': "Custom APT key file", 'action': 'append'},
+    'custom-package': {'help': "Custom package to install from repositories", 'action': 'append', '_remame': 'custom_packages'},
 }
 
-# Create the option parser
+# Create the option parser and add arguments from options
 parser = argparse.ArgumentParser()
-for k, v in options.items():
-    help_string, default_value_thunk = v[0], v[1]
-    if default_value_thunk is None:
-        parser.add_argument('--' + k, type=str, help=help_string)
-    else:
-        parser.add_argument('--' + k, type=str, help=help_string, default=default_value_thunk())
-
-# The debug option is a bit special since it's different type
-parser.add_argument('--debug', help="Enable debug output", action='store_true')
-
-# Custom APT entry and APT key options can be used multiple times
-parser.add_argument('--custom-apt-entry', help="Custom APT entry", action='append')
-parser.add_argument('--custom-apt-key', help="Custom APT key file", action='append')
-parser.add_argument('--custom-package', help="Custom package to install from repositories", action='append')
+for name, arguments in options.items():
+    parser.add_argument('--' + name, **{k: v for k, v in arguments.items() if not k.startswith('_')})
 
 args = vars(parser.parse_args())
 
-# Validate options
+# Catch list-all-targets before everything else
+if 'list_all_targets' in args and args['list_all_targets'] is True:
+    print('Available architectures for build with their targets:')
+    arch_tree = target_helper.get_available_target_tree()
+    for arch, targets in arch_tree.items():
+        print('-> {}'.format(arch))
+        for target in targets:
+            print('   - {}'.format(target))
+    sys.exit(1)
+
+# Validate given value if validation function is present.
 for k, v in args.items():
     key = field_to_option(k)
-    func = get_validator(options, k)
-    if func is not None:
-        if not func(v):
+    if '_validator' in options[key]:
+        if not options[key]['_validator'](v):
             print("{v} is not a valid value for --{o} option".format(o=key, v=v))
             sys.exit(1)
+
+# Rename parameters that don't match the config options
+for key, value in args.copy().items():
+    modified_key = field_to_option(key)
+    if '_rename' in options[modified_key]:
+        # remove old name, set value with new name
+        del args[key]
+        args[options[modified_key]['_rename']] = value
+
+# Select the right platform configuration
+# Magic value checking if for the legacy config compat layer to work. 
+# TODO: Please remove check once compat is obsolete
+target_module = None
+if not ('MAGIC_VALUE_DO_NOT_LOAD_ARCH' in target_helper.config and target_helper.config['MAGIC_VALUE_DO_NOT_LOAD_ARCH'] is True):
+    target_module = target_helper.load_architecture(
+        args['build_architecture'] if args['build_architecture'] is not None else target_helper.config['build_architecture'],
+        args['build_target'] if args['build_target'] is not None else target_helper.config['build_target']
+    )
 
 # Some fixup for mirror settings.
 # The idea is: if --debian-mirror is specified but --pbuilder-debian-mirror is not,
 # use the --debian-mirror value for both lb and pbuilder bootstrap
-if (args['debian_mirror'] != build_defaults["debian_mirror"]) and \
-   (args['pbuilder_debian_mirror'] == build_defaults["debian_mirror"]):
+if (args['debian_mirror'] != target_helper.config["debian_mirror"]) and \
+   (args['pbuilder_debian_mirror'] == target_helper.config["debian_mirror"]):
     args['pbuilder_debian_mirror'] = args['debian_mirror']
+
+# apply argument values as override
+target_helper.config.merge(args, priority=True)
 
 # Version can only be set for release builds,
 # for dev builds it hardly makes any sense
-if args['build_type'] == 'development':
-    if args['version'] is not None:
+if target_helper.config['build_type'] == 'development':
+    if 'version' in target_helper.config and target_helper.config['version'] is not None:
         print("Version can only be set for release builds")
         print("Use --build-type=release option if you want to set version number")
         sys.exit(1)
 
 # Populate some defaults that are not configurable,
 # but that are handy to have in the options hash
-args['distribution'] = build_defaults["debian_distribution"]
-args['build_dir'] = defaults.BUILD_DIR
-args['pbuilder_config'] = defaults.PBUILDER_CONFIG
-args['vyos_branch'] = build_defaults["vyos_branch"]
-args['release_train'] = build_defaults["release_train"]
-
-# Add custom packages from build defaults
-if not args['custom_package']:
-    args['custom_package'] = []
-args['custom_package'] = args['custom_package'] + build_defaults['custom_packages']
-
-if not args['custom_apt_entry']:
-    args['custom_apt_entry'] = []
-args['custom_apt_entry'] = args['custom_apt_entry'] + build_defaults['additional_repositories']
-
+target_helper.config['build_dir'] = defaults.BUILD_DIR
+target_helper.config['pbuilder_config'] = defaults.PBUILDER_CONFIG
 
 # Check the build environment and dependencies
-env_check_retval = os.system("scripts/check-build-env")
+env_check_retval = check_build_env.check()
 if env_check_retval > 0:
     print("Build environment check failed, fix the issues and retry")
 
-args['kernel_version'] = build_defaults['kernel_version']
-args['kernel_flavor'] = build_defaults['kernel_flavor']
-
-
 # Save to file
+exported_config = target_helper.config.to_dict()
 os.makedirs(defaults.BUILD_DIR, exist_ok=True)
 print("Saving the build config to {0}".format(defaults.BUILD_CONFIG))
 with open(defaults.BUILD_CONFIG, 'w') as f:
-    json.dump(args, f, indent=4, sort_keys=True)
+    json.dump(exported_config, f, indent=4, sort_keys=True)
     print("\n", file=f)
 
+# Run BuildPreparation module. This creates the live-build config. 
+prepare.prepare(exported_config)
+
+# Run the targets configure hook if it has one. 
+if target_module is not None and hasattr(target_module, '_configure_hook'):
+    target_module._configure_hook(exported_config)

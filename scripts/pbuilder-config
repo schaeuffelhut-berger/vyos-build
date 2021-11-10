@@ -37,7 +37,7 @@ BUILDPLACE={{build_dir}}/pbuilder/
 MIRRORSITE={{pbuilder_debian_mirror}}
 BUILDRESULT={{build_dir}}/pbuilder/result/
 
-DISTRIBUTION={{distribution}}
+DISTRIBUTION={{debian_distribution}}
 
 ARCHITECTURE={{architecture}}
 
